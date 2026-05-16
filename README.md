@@ -1,1042 +1,645 @@
-# LG-C1-kernel
-
-Documentación de los experimentos de arranque alternativo en una LG OLED C1 / webOS usando `kexec`.
-
-> **Estado actual:** `kexec -l` funciona y carga correctamente el kernel LG original extraído, el DTB y el initramfs.  
-> **Bloqueo actual:** `kexec -e` no consigue arrancar limpiamente un segundo kernel. Incluso al hacer kexec hacia el propio webOS original, la TV se congela y reinicia a los ~10 segundos con `PowerOnReason=cpuAbnormal`.
-
+LG C1 / webOS kexec research notes
+This document summarizes the current state of the `LG-C1-kernel` research effort: attempting to boot a custom kernel on an LG C1 webOS TV using `kexec`, identifying LG's crash/dump mechanisms, and assessing whether an Android port would need to run on top of the stock webOS kernel.
+> **Safety warning**
+>
+> Do **not** overwrite internal eMMC partitions such as kernel, rootfs, tvservice, bootloader, partinfo, or system partitions. The commands documented here are intended to be read-only unless explicitly marked otherwise. A wrong `dd of=/dev/mmcblk0pXX` can brick the TV.
 ---
-
-## ⚠️ Aviso importante
-
-No sobrescribir particiones internas de la TV.
-
-En particular, **no escribir nunca** en:
-
-- kernel
-- rootfs
-- tvservice
-- particiones `mmcblk0*`
-- bootloader
-- particiones de actualización A/B
-
-Todo el trabajo descrito aquí se ha hecho leyendo desde la eMMC y escribiendo únicamente en:
-
-- USB stick montado en `/tmp/usb/sda/sda1`
-- `/media` / `/media/internal` para pruebas de marcador
-- repo de desarrollo en la NanoPi
-
-La TV muestra este aviso al entrar por SSH:
-
+Device tested
+Observed device and firmware state:
 ```text
-NEVER EVER OVERWRITE SYSTEM PARTITIONS LIKE KERNEL, ROOTFS, TVSERVICE.
-Your TV will be bricked, guaranteed!
+Model: OLED65C17LB
+SoC:   LG O20B0
+webOS: 4.05.48
+Kernel: 4.4.84-229.1.kavir.2
+Arch:  AArch64
 ```
-
+Relevant stock kernel command line:
+```text
+root=/dev/mmcblk0p27 ro rootfstype=squashfs vmalloc=1216M \
+hma=856M@0x047800000;360M@0x0a9800000 \
+lg1k.use_vmap=1 hma.use_vmap=1 use_vmap=1 cma_on \
+console=ttyAMA0,115200n81 chip=O20B0 sver=4.05.48 bver=4.05.48 \
+quiet loglevel=0 snapshot resume=/dev/mmcblk0p51 devtmpfs.mount=1 rootwait \
+emmc_size=0x1d2000000 sbkey=0x7d0e0000 portProtection \
+mmcoops=dump wdtlog=dump@1M \
+modelName=OLED65C17LB debugMode=5 cmdEnd
+```
+Important parameters:
+```text
+console=ttyAMA0,115200n81
+mmcoops=dump
+wdtlog=dump@1M
+snapshot resume=/dev/mmcblk0p51
+```
+No `crashkernel=` parameter is present.
 ---
-
-## Hardware / sistema probado
-
-TV:
-
+Test files used
+The working USB directory contained:
 ```text
-Modelo: LG OLED C1
-modelName=OLED65C17LB
-chip=O20B0
-webOS TV 6.x
-kernel=4.4.84-229.1.kavir.2
-arch=aarch64
-```
-
-Kernel en ejecución:
-
-```sh
-uname -a
-```
-
-Resultado observado:
-
-```text
-Linux LGwebOSTV 4.4.84-229.1.kavir.2 #1 SMP PREEMPT Mon Jan 17 08:08:42 UTC 2022 aarch64 GNU/Linux
-```
-
-Cmdline original observada:
-
-```text
-root=/dev/mmcblk0p27 ro rootfstype=squashfs vmalloc=1216M hma=856M@0x047800000;360M@0x0a9800000 lg1k.use_vmap=1 hma.use_vmap=1 use_vmap=1 cma_on ethaddr=... rev=1 console=ttyAMA0,115200n81 chip=O20B0 sver=4.05.48 bver=4.05.48 quiet loglevel=0 snapshot resume=/dev/mmcblk0p51 devtmpfs.mount=1 rootwait emmc_size=0x1d2000000 ... modelName=OLED65C17LB ...
-```
-
----
-
-## Objetivo inicial
-
-Arrancar Android o Linux alternativo sin tocar particiones internas.
-
-Diseño deseado:
-
-```text
-webOS arranca lo mínimo
-↓
-hook Homebrew / SSH manual
-↓
-kexec carga kernel LG original + DTB + initramfs desde USB
-↓
-webOS queda reemplazado
-↓
-initramfs monta Android/Linux desde /media/internal
-```
-
-Diseño de almacenamiento previsto:
-
-```text
-USB stick:
-  /lgc1-kexec/
-    kexec-run
-    kexec
-    ld-linux-aarch64.so.1
-    libc.so.6
-    libz.so.1
-    Image
-    initramfs.cpio.gz
-    lgc1-running.dtb
-    wdctl-lgc1
-
-Interno:
-  /media/internal/android-root/
-```
-
----
-
-## Resultado resumido
-
-### Funciona
-
-- Acceso SSH root.
-- USB montado automáticamente.
-- DTB extraído desde `/sys/firmware/fdt`.
-- Kernel LG original localizado en `/dev/mmcblk0p21`.
-- Kernel LG desempaquetado desde formato `LZ4P`.
-- `Image` resultante reconocido como `Linux kernel ARM64 boot executable Image`.
-- `kexec-tools` funciona en la TV usando wrapper con linker/librerías desde USB.
-- `kexec -l` devuelve `0`.
-- Carga en memoria alta funciona con `--mem-min=0x80000000 --mem-max=0xa9000000`.
-- Se puede desactivar el watchdog Linux normal con `WDIOC_SETOPTIONS / WDIOS_DISABLECARD`.
-
-### No funciona todavía
-
-- `kexec -e` no arranca limpiamente el segundo kernel.
-- El initramfs no llega a dejar marcadores.
-- Incluso kexec hacia el propio webOS original falla.
-- La TV congela imagen y reinicia a los ~10 segundos.
-- Logs posteriores muestran `PowerOnReason=cpuAbnormal`.
-- El reset persiste aunque `/dev/watchdog` y `/dev/watchdog0` aceptan `WDIOS_DISABLECARD`.
-
-Conclusión actual:
-
-```text
-El problema no está en Android, initramfs ni /media/internal.
-El problema está en la transición kexec / machine_kexec / firmware / DPM watchdog / plataforma LG O20.
-```
-
----
-
-## Layout de particiones relevante
-
-USB:
-
-```text
-/dev/sda1 -> /tmp/usb/sda/sda1
-LABEL="WEBOSBOOT"
-TYPE="vfat"/tfat
-```
-
-Root webOS activo:
-
-```text
-/dev/mmcblk0p27
-TYPE=squashfs
-```
-
-Datos internos:
-
-```text
-/dev/mmcblk0p56
-TYPE=ext4
-Montado por webOS bajo /media
-/media/internal existe dentro de esa partición
-```
-
-Kernel LG extraído:
-
-```text
-/dev/mmcblk0p21
-24 MiB
-Cabecera: LZ4P
-Contiene ARMd y strings 4.4.84-229.1.kavir.2
-```
-
-Snapshot/resume:
-
-```text
-/dev/mmcblk0p51
-150 MiB
-cmdline original: snapshot resume=/dev/mmcblk0p51
-Contiene strings Linux / LGwebOSTV / 4.4.84
-```
-
-Metadatos boot:
-
-```text
-/dev/mmcblk0p4
-Contiene strings:
-  kernel
-  kernel.lz4
-  bootargs
-  decomp_kernel
-  setup_kernel_params
-```
-
----
-
-## Preparar USB en la TV
-
-Ruta usada:
-
-```sh
-USB=/tmp/usb/sda/sda1
-BOOT="$USB/lgc1-kexec"
-mkdir -p "$BOOT"
-```
-
-Extraer DTB real:
-
-```sh
-cp /sys/firmware/fdt "$BOOT/lgc1-running.dtb"
-```
-
-Guardar datos diagnósticos:
-
-```sh
-cat /proc/cmdline > "$BOOT/cmdline-webos.txt"
-uname -a > "$BOOT/uname.txt"
-cat /proc/cpuinfo > "$BOOT/cpuinfo.txt"
-cat /proc/meminfo > "$BOOT/meminfo.txt"
-cat /proc/partitions > "$BOOT/partitions.txt"
-dmesg > "$BOOT/dmesg-before-kexec.txt"
-sync
-```
-
----
-
-## Localizar y extraer el kernel original
-
-Escaneo básico de particiones:
-
-```sh
-USB=/tmp/usb/sda/sda1
-BOOT="$USB/lgc1-kexec/extracted"
-mkdir -p "$BOOT"
-
-for p in 4 21 51 2 3; do
-  echo "=== copying /dev/mmcblk0p$p ==="
-  dd if=/dev/mmcblk0p$p of="$BOOT/mmcblk0p$p.bin" bs=1M
-  sync
-  ls -lh "$BOOT/mmcblk0p$p.bin"
-done
-```
-
-Resultado clave:
-
-```text
-mmcblk0p21.bin:
-  24 MiB
-  empieza por LZ4P
-  contiene ARMd
-  contiene Linux version 4.4.84-229.1.kavir.2
-```
-
----
-
-## Desempaquetar `LZ4P` en NanoPi
-
-La NanoPi usada:
-
-```text
-pi@192.168.2.200
-```
-
-Directorio de trabajo:
-
-```sh
-mkdir -p ~/disk/LG-C1-kernel
-cd ~/disk/LG-C1-kernel
-```
-
-Script `scripts/unpack_lg_lz4p.py`:
-
-```python
-#!/usr/bin/env python3
-import struct
-import sys
-from pathlib import Path
-
-try:
-    import lz4.block
-except Exception as e:
-    print("ERROR: falta python3-lz4 o pip install lz4:", e)
-    sys.exit(1)
-
-if len(sys.argv) != 3:
-    print(f"Uso: {sys.argv[0]} input.LZ4P output.bin")
-    sys.exit(1)
-
-inp = Path(sys.argv[1])
-outp = Path(sys.argv[2])
-data = inp.read_bytes()
-
-if data[:4] != b"LZ4P":
-    print("No empieza por LZ4P")
-    sys.exit(1)
-
-uncomp_size, comp_size, chunk_size, block_count = struct.unpack_from("<IIII", data, 4)
-
-print(f"uncompressed size: 0x{uncomp_size:x} ({uncomp_size})")
-print(f"compressed size-ish: 0x{comp_size:x} ({comp_size})")
-print(f"chunk size: 0x{chunk_size:x} ({chunk_size})")
-print(f"block count: {block_count}")
-
-sizes_off = 0x20
-sizes = list(struct.unpack_from("<" + "I" * block_count, data, sizes_off))
-table_end = sizes_off + 4 * block_count
-
-candidates = [
-    table_end,
-    (table_end + 0x0f) & ~0x0f,
-    (table_end + 0xff) & ~0xff,
-    (table_end + 0x1ff) & ~0x1ff,
-    (table_end + 0x3ff) & ~0x3ff,
-    0x400,
-    0x800,
-    0x1000,
-]
-
-last_error = None
-
-for data_off in candidates:
-    print(f"\n[*] Probando data offset 0x{data_off:x}")
-    pos = data_off
-    chunks = []
-    ok = True
-
-    for i, sz in enumerate(sizes):
-        if sz == 0:
-            chunks.append(b"\x00" * chunk_size)
-            continue
-
-        block = data[pos:pos + sz]
-        pos += sz
-
-        try:
-            dec = lz4.block.decompress(block, uncompressed_size=chunk_size)
-        except Exception as e1:
-            try:
-                dec = lz4.block.decompress(block)
-            except Exception as e2:
-                last_error = (i, sz, e1, e2)
-                print(f"    fallo bloque {i}, size={sz}: {e1} / {e2}")
-                ok = False
-                break
-
-        chunks.append(dec)
-
-    if not ok:
-        continue
-
-    out = b"".join(chunks)[:uncomp_size]
-    outp.write_bytes(out)
-
-    print(f"[+] OK: escrito {outp} ({len(out)} bytes)")
-    print("[+] Buscando ARM64 magic ARMd...")
-    idx = out.find(b"ARMd")
-    print(f"    ARMd offset: {idx if idx >= 0 else 'not found'}")
-    idx2 = out.find(b"Linux version")
-    print(f"    Linux version offset: {idx2 if idx2 >= 0 else 'not found'}")
-    sys.exit(0)
-
-print("\nNo se pudo desempaquetar con offsets probados.")
-print("Último error:", last_error)
-sys.exit(2)
-```
-
-Uso:
-
-```sh
-python3 scripts/unpack_lg_lz4p.py mmcblk0p21.bin p21-unpacked.bin
-```
-
-Resultado observado:
-
-```text
-uncompressed size: 0x1da3600 (31077888)
-compressed size-ish: 0xf13c77 (15809655)
-chunk size: 0x40000 (262144)
-block count: 119
-
-[*] Probando data offset 0x1fc
-[+] OK: escrito p21-unpacked.bin (31077888 bytes)
-ARMd offset: 56
-Linux version offset: 14024832
-```
-
-Comprobación:
-
-```sh
-file p21-unpacked.bin
-strings p21-unpacked.bin | grep -E -m20 'Linux version|4\.4\.84|kavir|ARMd|bootargs|LGwebOSTV'
-```
-
-Resultado:
-
-```text
-p21-unpacked.bin: Linux kernel ARM64 boot executable Image, little-endian, 4K pages
-Linux version 4.4.84-229.1.kavir.2 ...
-```
-
-Como `ARMd` estaba en offset `56`, el `Image` empieza en `0`:
-
-```sh
-cp p21-unpacked.bin Image.lg
-scp Image.lg root@192.168.2.121:/tmp/usb/sda/sda1/lgc1-kexec/Image
-```
-
----
-
-## kexec-tools en la TV
-
-La TV no tenía `kexec` instalado.
-
-Se copió `kexec` aarch64 desde la NanoPi, junto con sus librerías:
-
-```text
+Image
+initramfs.cpio.gz
+lgc1-running.dtb
 kexec
 ld-linux-aarch64.so.1
 libc.so.6
 libz.so.1
+wdctl-lgc1
+cmdline-webos.txt
+reserved-memory.txt
+iomem.txt
+partitions.txt
+meminfo.txt
+cpuinfo.txt
+uname.txt
+dmesg-before-kexec.txt
+kexec-debug-load*.txt
+kexec-probe.log
+pause-boot-probe.log
 ```
-
-Como el binario era dinámico, ejecutarlo directamente daba:
-
-```text
--sh: ./kexec: not found
-```
-
-Solución: wrapper `kexec-run`.
-
-`tv/kexec-run`:
-
-```sh
-#!/bin/sh
-
-DIR="$(cd "$(dirname "$0")" && pwd)"
-
-PRELOAD=/etc/ld.so.preload
-EMPTY=/tmp/empty-ld-so-preload
-BOUND=0
-
-# webOS tiene /etc/ld.so.preload apuntando a una libSegFault ELF32.
-# Nuestro kexec usa glibc aarch64, así que el loader intenta precargarla y avisa.
-# Montamos temporalmente un preload vacío solo durante esta ejecución.
-if [ -f "$PRELOAD" ]; then
-  : > "$EMPTY"
-  if mount --bind "$EMPTY" "$PRELOAD" 2>/dev/null; then
-    BOUND=1
-  fi
-fi
-
-"$DIR/ld-linux-aarch64.so.1" --library-path "$DIR" "$DIR/kexec" "$@"
-RC=$?
-
-if [ "$BOUND" = "1" ]; then
-  umount "$PRELOAD" 2>/dev/null
-fi
-
-exit "$RC"
-```
-
-Prueba:
-
-```sh
-cd /tmp/usb/sda/sda1/lgc1-kexec
-./kexec-run --version
-```
-
-Resultado:
-
-```text
-kexec-tools 2.0.28
-```
-
+The local `kexec` binary and its libraries were supplied from USB. The retail firmware did not provide `/usr/sbin/kexec`.
 ---
-
-## Initramfs de prueba
-
-Estructura del repo:
-
-```text
-LG-C1-kernel/
-  initramfs/rootfs/
-  scripts/
-  tv/
-  tools/
-  out/
-```
-
-Script de build `scripts/build-initramfs.sh`:
-
-```sh
-#!/bin/sh
-set -eu
-
-REPO="$(cd "$(dirname "$0")/.." && pwd)"
-ROOT="$REPO/initramfs/rootfs"
-OUT="$REPO/out/initramfs.cpio.gz"
-
-mkdir -p "$REPO/out"
-
-if [ ! -x /bin/busybox ]; then
-  echo "ERROR: falta /bin/busybox."
-  echo "Instala busybox-static:"
-  echo "sudo apt install busybox-static"
-  exit 1
-fi
-
-cp -L /bin/busybox "$ROOT/bin/busybox"
-chmod +x "$ROOT/bin/busybox"
-
-for app in sh mount cat echo sleep dmesg ls mkdir sync reboot grep cp find; do
-  ln -sf /bin/busybox "$ROOT/bin/$app"
-done
-
-cd "$ROOT"
-find . -print0 | cpio --null -ov --format=newc | gzip -9 > "$OUT"
-
-ls -lh "$OUT"
-```
-
-Script de copia `scripts/push-to-tv.sh`:
-
-```sh
-#!/bin/sh
-set -eu
-
-TV="${TV:-root@192.168.2.121}"
-DEST="${DEST:-/tmp/usb/sda/sda1/lgc1-kexec}"
-REPO="$(cd "$(dirname "$0")/.." && pwd)"
-
-scp "$REPO/out/initramfs.cpio.gz" "$TV:$DEST/initramfs.cpio.gz"
-scp "$REPO/tv/kexec-run" "$TV:$DEST/kexec-run"
-scp "$REPO/tv/kexec" "$TV:$DEST/kexec"
-scp "$REPO/tv/ld-linux-aarch64.so.1" "$TV:$DEST/ld-linux-aarch64.so.1"
-scp "$REPO/tv/libc.so.6" "$TV:$DEST/libc.so.6"
-scp "$REPO/tv/libz.so.1" "$TV:$DEST/libz.so.1"
-
-ssh "$TV" "cd '$DEST' && chmod +x kexec-run kexec ld-linux-aarch64.so.1"
-
-echo "Copiado initramfs + kexec bundle a $TV:$DEST"
-```
-
----
-
-## Prueba `kexec -l`
-
-Primera prueba con initramfs:
-
+Initial kexec status
+Normal kexec load
+`kexec -l` succeeds with the supplied image, DTB, and initramfs.
+Representative command:
 ```sh
 cd /tmp/usb/sda/sda1/lgc1-kexec
 
-CMDLINE="$(cat ./cmdline-webos.txt) rdinit=/init loglevel=8"
+CMDLINE='console=ttyAMA0,115200n81 earlycon=pl011,mmio32,0xfe000000 ignore_loglevel loglevel=8 rdinit=/init root=/dev/ram0 rw maxcpus=1 nr_cpus=1 reset_devices irqpoll'
 
-./kexec-run -l ./Image \
-  --initrd=./initramfs.cpio.gz \
+./ld-linux-aarch64.so.1 --library-path . ./kexec -l ./Image \
   --dtb=./lgc1-running.dtb \
-  --append="$CMDLINE"
+  --initrd=./initramfs.cpio.gz \
+  --append="$CMDLINE" \
+  --debug
 
-echo "kexec_load_rc=$?"
+cat /sys/kernel/kexec_loaded
 ```
-
-Resultado:
-
-```text
-Can't open (/proc/kcore).
-Warning, can't get the VA_BITS from kcore
-Can't open (/proc/kcore).
-kexec_load_rc=0
-```
-
-El warning de `/proc/kcore` no bloquea la carga.
-
----
-
-## Mapa de memoria
-
-`/proc/iomem` relevante:
-
-```text
-00000000-337fffff : System RAM
-  00088000-017bbfff : Kernel code
-  01838000-023eefff : Kernel data
-47800000-7cffffff : System RAM
-80000000-bfffffff : System RAM
-fd200000-fd200fff : /amba/watchdog@fd200000
-fe000000-fe000fff : /amba/serial@fe000000
-```
-
-Reserved memory desde device-tree:
-
-```text
-kdrv_buffer1:
-  base 0x33800000
-  size 0x4c800000
-  no-map
-
-kdrv_buffer2:
-  base 0xa9800000
-  size 0x16800000
-  no-map
-```
-
-Interpretación:
-
-```text
-RAM baja:
-  0x00000000 - 0x337fffff
-
-Reservado / HMA:
-  0x33800000 - 0x7fffffff
-
-RAM alta usable:
-  0x80000000 - 0xa97fffff
-
-Reservado / HMA:
-  0xa9800000 - 0xbfffffff
-```
-
-Carga original en memoria baja:
-
-```text
-kernel: 0x00088000
-initrd: 0x023ef000
-dtb:    0x024e5000
-```
-
-Carga high2 usada:
-
+After loading, `/sys/kernel/kexec_loaded` reports `1`.
+Executing kexec
+Executing the loaded kernel:
 ```sh
-./kexec-run -l ./Image \
-  --mem-min=0x80000000 \
-  --mem-max=0xa9000000 \
-  --initrd=./initramfs.cpio.gz \
-  --dtb=./lgc1-running.dtb \
-  --append="$CMDLINE"
+sync
+./ld-linux-aarch64.so.1 --library-path . ./kexec -e
 ```
-
-Resultado debug:
-
+Observed behavior:
 ```text
-image_arm64_load: kernel_segment: 0000000080000000
-kexec_load: entry = 0x824ea680 flags = 0xb70000
-
-segment[0].mem = 0x80088000  kernel
-segment[1].mem = 0x823ef000  initrd
-segment[2].mem = 0x824e5000  dtb
-segment[3].mem = 0x824ea000  purgatory
+kexec -e starts the transition.
+The current SSH session dies.
+The TV reboots after roughly 10-15 seconds.
+After reboot, webOS starts normally again.
 ```
-
+No output is visible through SSH after `kexec -e`.
 ---
-
-## Watchdog
-
-Config del kernel:
-
+kexec -p / kdump status
+`kexec -p` is not usable on this boot because no standard crashkernel memory is reserved.
+Observed state:
+```sh
+tr ' ' '\n' < /proc/cmdline | grep -i crash || true
+cat /sys/kernel/kexec_crash_loaded
+cat /sys/kernel/kexec_crash_size
+```
+Result:
 ```text
+no crashkernel parameter
+kexec_crash_loaded = 0
+kexec_crash_size   = 0
+```
+`/proc/iomem` showed System RAM regions but no standard crashkernel reservation.
+Kernel config findings:
+```text
+CONFIG_KEXEC=y
+CONFIG_CRASH_DUMP is not set
+CONFIG_PSTORE is not set
 CONFIG_DPM_WATCHDOG=y
-CONFIG_DPM_WATCHDOG_TIMEOUT=5
-CONFIG_WATCHDOG=y
-CONFIG_WATCHDOG_CORE=y
-# CONFIG_WATCHDOG_NOWAYOUT is not set
 CONFIG_ARM_SP805_WATCHDOG=y
+CONFIG_WATCHDOG_NOWAYOUT is not set
 ```
-
-Dispositivos:
-
+There is a custom LG memory report:
 ```text
+/proc/kdump_mem = 124M@0x56c00000
+```
+However, this is not recognized by upstream `kexec -p` as standard crashkernel memory.
+Conclusion:
+```text
+The stock retail boot does not provide a usable upstream kdump path.
+```
+---
+LG kdump service investigation
+`kdump.service` exists:
+```ini
+[Service]
+Type=simple
+EnvironmentFile=-/var/systemd/system/env/kdump.env
+ExecStart=/lib/systemd/system/scripts/kdump.sh
+RemainAfterExit=yes
+```
+The service reports `active (exited)` because the script exits successfully. It does not mean a crash kernel is armed.
+The script checks for `crashkernel` in `/proc/cmdline` and then attempts something equivalent to:
+```sh
+/usr/sbin/kexec -i -p /boot/kdImage-1.0.14-162 \
+  --command-line="root=... init=/sbin/init.kdump maxcpus=1 reset_devices mem=$(cat /proc/kdump_mem) wdtlog=dump@1M secondkernel"
+```
+On this retail firmware, the required files do not exist:
+```text
+/boot/kdImage-1.0.14-162  -> missing
+/sbin/init.kdump          -> missing
+/usr/sbin/kexec           -> missing
+```
+A wider search did not find alternate `kdImage`, `init.kdump`, or `/usr/sbin/kexec` pieces.
+Conclusion:
+```text
+LG kdump infrastructure is partially present, but non-functional on this retail firmware.
+```
+---
+UART / framebuffer / pstore observability
+UART
+The kernel console is configured for:
+```text
+console=ttyAMA0,115200n81
+```
+However, no physical UART was available during these tests. Therefore, anything printed after `kexec -e` would not be visible over SSH.
+Framebuffer
+Framebuffer devices exist:
+```text
+/dev/fb0
+/dev/fb1
+/dev/fb2
+/dev/fb3
+```
+`/proc/fb` showed:
+```text
+0 osd0_fb
+1 osd1_fb
+2 osd2_fb
+3 crsr_fb
+```
+Observed framebuffer characteristics included:
+```text
+fb0 osd0_fb: 1920x2160, 32 bpp, stride 7680
+fb1 osd1_fb: 512x4320, 32 bpp, stride 2048
+fb2 osd2_fb: 128x4, 32 bpp
+fb3 crsr_fb: 256x512, 32 bpp
+```
+Writes to `/dev/fb0` and `/dev/fb1` did not produce visible on-screen output. Therefore framebuffer could not be used as a reliable post-kexec debug channel.
+pstore
+`CONFIG_PSTORE` is not set. No usable `/sys/fs/pstore` logs were available.
+Conclusion:
+```text
+No reliable post-kexec output channel is currently available without physical UART.
+```
+---
+Watchdog / reset investigation
+Relevant watchdog devices and symbols were found:
+```text
+/sys/bus/amba/devices/fd200000.watchdog
+/sys/bus/amba/drivers/sp805-wdt
+/sys/devices/platform/wdt_detect
 /dev/watchdog
 /dev/watchdog0
 ```
-
-Herramienta `wdctl-lgc1`:
-
-```c
-#include <errno.h>
-#include <fcntl.h>
-#include <linux/watchdog.h>
-#include <stdio.h>
-#include <string.h>
-#include <sys/ioctl.h>
-#include <unistd.h>
-
-static int try_dev(const char *dev) {
-    int fd = open(dev, O_RDWR | O_CLOEXEC);
-    if (fd < 0) {
-        printf("%s: open failed: %s\n", dev, strerror(errno));
-        return 1;
-    }
-
-    printf("%s: opened\n", dev);
-
-    int timeout = 120;
-    if (ioctl(fd, WDIOC_SETTIMEOUT, &timeout) == 0) {
-        printf("%s: WDIOC_SETTIMEOUT ok, timeout=%d\n", dev, timeout);
-    } else {
-        printf("%s: WDIOC_SETTIMEOUT failed: %s\n", dev, strerror(errno));
-    }
-
-    int get_timeout = 0;
-    if (ioctl(fd, WDIOC_GETTIMEOUT, &get_timeout) == 0) {
-        printf("%s: WDIOC_GETTIMEOUT=%d\n", dev, get_timeout);
-    } else {
-        printf("%s: WDIOC_GETTIMEOUT failed: %s\n", dev, strerror(errno));
-    }
-
-    int flags = WDIOS_DISABLECARD;
-    if (ioctl(fd, WDIOC_SETOPTIONS, &flags) == 0) {
-        printf("%s: WDIOS_DISABLECARD ok\n", dev);
-    } else {
-        printf("%s: WDIOS_DISABLECARD failed: %s\n", dev, strerror(errno));
-    }
-
-    if (write(fd, "V", 1) == 1) {
-        printf("%s: magic close V written\n", dev);
-    } else {
-        printf("%s: magic close V failed: %s\n", dev, strerror(errno));
-    }
-
-    close(fd);
-    printf("%s: closed\n", dev);
-    return 0;
-}
-
-int main(void) {
-    int rc0 = try_dev("/dev/watchdog0");
-    int rc1 = try_dev("/dev/watchdog");
-    return (rc0 && rc1) ? 1 : 0;
-}
-```
-
-Compilación:
-
-```sh
-gcc -O2 -Wall -static -o tv/wdctl-lgc1 tools/wdctl-lgc1.c || gcc -O2 -Wall -o tv/wdctl-lgc1 tools/wdctl-lgc1.c
-```
-
-Resultado en TV:
-
+Relevant runtime parameters:
 ```text
-/dev/watchdog0: opened
-/dev/watchdog0: WDIOC_SETTIMEOUT ok, timeout=43
-/dev/watchdog0: WDIOC_GETTIMEOUT=43
-/dev/watchdog0: WDIOS_DISABLECARD ok
-/dev/watchdog0: magic close V written
-/dev/watchdog0: closed
-/dev/watchdog: opened
-/dev/watchdog: WDIOC_SETTIMEOUT ok, timeout=43
-/dev/watchdog: WDIOC_GETTIMEOUT=43
-/dev/watchdog: WDIOS_DISABLECARD ok
-/dev/watchdog: magic close V written
-/dev/watchdog: closed
-wdctl_rc=0
+dpm_watchdog_timeout = 5
+dpm_watchdog_timeout_userresume = 20
+stmmac watchdog = 5000
 ```
-
-A pesar de ello, `kexec -e` sigue reiniciando a los ~10 segundos.
-
-Conclusión:
-
+Tests performed:
+Changed DPM watchdog timeout from `5` to `120`.
+Changed DPM userresume timeout from `20` to `120`.
+Attempted `/dev/watchdog` magic close with `V`.
+Re-ran `kexec -e`.
+Result:
 ```text
-El reset no parece venir del watchdog Linux normal expuesto como /dev/watchdog.
-Probablemente interviene DPM watchdog, firmware/PMU/TEE o reset externo de plataforma.
+The TV rebooted after the same ~10-15 second interval.
 ```
-
+Conclusion:
+```text
+The reset is not controlled by the sysfs DPM timeout parameter or the regular /dev/watchdog path tested here.
+```
+The suspected reset path is platform/MICOM/firmware-specific or occurs after the running Linux kernel has already left control.
 ---
-
-## Pruebas realizadas con `kexec -e`
-
-### 1. Kernel LG + initramfs mínimo
-
-Resultado:
-
+faultmanager evidence: PowerOnReason=cpuAbnormal
+webOS faultmanager logs were found under:
 ```text
-pantalla congelada
-sonido petado / ruido
-apagado o reset
-sin marcadores
+/var/spool/faultmanager/crash/
+  crash_fault_logs.tar.gz
+  crash_fault_logs.0.tar.gz
+  crash_fault_logs.1.tar.gz
+  crash_fault_logs.2.tar.gz
 ```
-
-### 2. Kernel LG + initramfs con reboot automático
-
-Resultado:
-
+These logs record different power-on reasons, including normal reasons and the abnormal reset reason.
+Observed after failed `kexec -e` attempts:
 ```text
-pantalla congelada
-reset a ~10 s
-SSH vuelve tras reinicio
-sin marcadores
+PowerOnReason=cpuAbnormal
+reason":"cpuAbnormal"
+power on reason string:cpuAbnormal, enum:14
 ```
-
-### 3. Kernel LG cargado en RAM alta `0x80000000`
-
-Resultado:
-
+The logs also show other normal boot reasons:
 ```text
-pantalla congelada
-reset a ~10 s
-SSH vuelve
-sin marcadores
+remoteKey
+micomPower
 ```
-
-### 4. Watchdog desactivado antes de `kexec -e`
-
-Comando:
-
-```sh
-./wdctl-lgc1
-sync
-./kexec-run -e
-```
-
-Resultado:
-
+This is important because `cpuAbnormal` is not simply a generic/default value. webOS/MICOM distinguishes it from normal boot causes.
+Conclusion:
 ```text
-pantalla congelada
-reset a ~10 s
-sin marcadores
+Failed kexec-e attempts reboot the platform and are recorded by webOS/MICOM as cpuAbnormal.
 ```
-
-### 5. Control: kexec hacia webOS original
-
-Se cargó:
-
-```sh
-CMDLINE="$(cat ./cmdline-webos.txt)"
-
-./kexec-run -l ./Image \
-  --mem-min=0x80000000 \
-  --mem-max=0xa9000000 \
-  --dtb=./lgc1-running.dtb \
-  --append="$CMDLINE"
-```
-
-Luego:
-
-```sh
-./wdctl-lgc1
-sync
-./kexec-run -e
-```
-
-Resultado:
-
-```text
-También reset a ~10 s.
-```
-
-Esto demuestra que el problema no está en Android/initramfs.
-
 ---
-
-## Logs post-reset
-
-`bootd.log`:
-
+Kernel symbols and LG-specific dump path
+`/proc/kallsyms` showed standard and LG-specific symbols relevant to this work.
+Standard kexec/panic symbols:
 ```text
-PowerOnReason = {"reason":"cpuAbnormal","returnValue":true}
-```
-
-`legacy-log`:
-
-```text
-dpm_watchdog timeout : 5
-dev:vdec, message : [    0.205133] 0x000000000000-0x000000001000 : "reset vector"
-```
-
-Otros datos:
-
-```text
-/mnt/lg/cmn_data/var/pbs_reset_check = temp
-/mnt/lg/cmn_data/*.dcd aparece tras las pruebas
-```
-
-El `.dcd` observado no contenía strings útiles.
-
----
-
-## Diagnóstico actual
-
-El estado actual se resume así:
-
-```text
-El kernel LG original se puede extraer y cargar con kexec.
-El DTB real se puede pasar a kexec.
-kexec-tools funciona.
-kexec_load() devuelve éxito.
-La ubicación de memoria high2 es válida.
-Pero el segundo kernel no arranca limpiamente.
-Incluso webOS original no arranca mediante kexec.
-```
-
-Hipótesis principales:
-
-```text
-1. machine_kexec de LG/O20 no deja la plataforma en estado válido.
-2. Hay un DPM watchdog o monitor externo no controlable desde /dev/watchdog.
-3. Firmware/TEE/PMU reinicia la CPU al detectar estado anómalo.
-4. Algún coprocesador/audio/video/DMA queda activo y provoca reset.
-5. El segundo kernel muere antes de UART/init, pero sin consola serie no se ve.
-```
-
----
-
-## Próximos pasos recomendados
-
-### Opción A — UART serie
-
-Necesaria para depuración real.
-
-La cmdline ya usa:
-
-```text
-console=ttyAMA0,115200n81 earlycon ignore_loglevel loglevel=8
-```
-
-Buscar pads UART 3.3 V en la placa y capturar salida durante `kexec -e`.
-
-Preguntas que UART debe responder:
-
-```text
-- ¿El purgatory entra?
-- ¿El segundo kernel imprime algo?
-- ¿Muere en early boot?
-- ¿Hay panic antes de initramfs?
-- ¿Hay reset externo sin logs?
-```
-
-### Opción B — Recompilar/instrumentar kernel LG
-
-El kernel original ya falla por kexec, así que recompilarlo solo no basta.  
-Pero sí permitiría instrumentar:
-
-```text
+machine_kexec_prepare
 machine_kexec
-cpu reset path
-watchdog/DPM
-early printk
-reboot notifiers
-device shutdown paths
+machine_kexec_cleanup
+machine_crash_shutdown
+kernel_kexec
+crash_kexec
+sys_kexec_load
+kexec_image
+kexec_crash_image
 ```
-
-### Opción C — Evitar kexec
-
-Mantener webOS y usar Android userspace/chroot/namespaces sobre el kernel vivo:
-
+LG-specific watchdog/dump/MICOM symbols:
 ```text
-webOS kernel vivo
-↓
-binder.ko cargado
-↓
-Android userspace parcial
+wdt_log_kexec_setup
+wdt_log_save
+wdt_log_ready
+wdt_detect_isr
+wdt_detect_proc
+wdt_detect_probe
+mmcoops_init
+wdt_log_init
+wdt_detect_init
+sys_proc_read_kdump_meminfo
+diag_panic_event
+diag_invoke_reset
+get_micom_disable
+set_micom_disable
+o20_ucom_FuncChipReset
 ```
-
-No sería Android 100% como sistema principal, pero evita el punto que falla: `kexec -e`.
-
+The kernel image also contains strings indicating LG's custom dump mechanism:
+```text
+mmcoops:Oops/panic log will be stored at %s partition (offset: 0x%llx)
+wdtlog:pmlog/legacy log will be stored at %s partition (offset: 0x%llx)
+wdtlog: Start second kernel
+wdtlog: file copy completed: %u bytes
+mmcoops=
+wdtlog=
+```
+This matches the stock command line:
+```text
+mmcoops=dump
+wdtlog=dump@1M
+```
+Conclusion:
+```text
+LG has a proprietary dump/logging path using a logical partition named dump. It is separate from upstream pstore and crash_dump.
+```
 ---
-
-## Comandos útiles de seguridad
-
-Descargar imagen kexec cargada:
-
+Partition map and identifying the dump partition
+Linux exposes 56 eMMC partitions:
+```text
+/dev/mmcblk0p1 ... /dev/mmcblk0p56
+```
+`blkid` only identifies some partitions as `squashfs` or `ext4`; many are raw/unknown.
+Important partition observations:
+```text
+p27 = active rootfs squashfs
+p51 = snapshot/resume partition, from cmdline resume=/dev/mmcblk0p51
+p54/p55/p56 = ext4 data-style partitions
+p38-p42 = likely backup/update mirror of p27-p31 layout
+```
+p4
+`p4` contains `lxboot` / LG bootloader code and strings, including:
+```text
+PARTINFO : Loaded O.K
+showpart
+display partinfo
+emmc dump offset|partition size
+mmcoops=dump
+wdtlog=dump@1M
+kernel.lz4
+rootfs.squashfs
+```
+This is bootloader/parser code, not the dump log partition.
+p21
+`p21` starts with:
+```text
+LZ4P
+ARMd
+```
+and contains many kernel strings including `machine_kexec_prepare`, `wdtlog`, `MMCOOPS`, etc. It appears to be a kernel or kernel-like firmware image.
+p2 and p3
+`p2` and `p3` contain the actual LG `partinfo` table and its backup. They include strings such as:
+```text
+h13_emmc
+secureboot
+partinfo
+PART.INFO
+mapbak
+boot
+kernel
+rootfs
+dbboot
+dump
+hist
+reserved
+```
+A parser was written to match partinfo offsets/sizes against Linux partition start/size information.
+Result:
+```text
+FOUND_DUMP_NAME=dump
+FOUND_DUMP_OFFSET=0xe7980000
+FOUND_DUMP_SIZE=0xa00000
+FOUND_DUMPDEV=/dev/mmcblk0p52
+```
+Therefore:
+```text
+dump = /dev/mmcblk0p52
+offset = 0xe7980000
+size   = 0x00a00000 = 10 MiB
+```
+---
+Proving mmcoops works
+Before a controlled panic, `/dev/mmcblk0p52` was all zeroes:
+```text
+p52 is all zero
+```
+A controlled Linux panic was triggered:
+```sh
+echo 1 > /proc/sys/kernel/sysrq
+sync
+echo c > /proc/sysrq-trigger
+```
+After reboot, `/dev/mmcblk0p52` contained a persistent panic/oops log.
+Observed strings from `p52-after-panic.bin`:
+```text
+sysrq: SysRq : Trigger a crash
+Unable to handle kernel NULL pointer dereference
+Internal error: Oops: 96000046 [#1] PREEMPT SMP
+CPU: 3 PID: ... Comm: sh
+PC is at sysrq_handle_crash+0x14/0x20
+Call trace:
+Kernel panic - not syncing: Fatal exception
+CPU0: stopping
+CPU1: stopping
+CPU2: stopping
+--- diagnosis panic event ----
+```
+Conclusion:
+```text
+LG mmcoops/dump works for normal Linux panics.
+```
+This is an important control test: the dump partition is real and functional.
+---
+kexec-e vs dump partition test
+A clean before/after comparison was performed around a failed `kexec -e` attempt.
+Procedure:
+Copy `/dev/mmcblk0p52` before `kexec -e`.
+Run `kexec -e`.
+Let the TV reboot normally. Do not unplug it.
+SSH back in.
+Copy `/dev/mmcblk0p52` again.
+Compare the two images.
+Result:
+```text
+P52_UNCHANGED
+```
+`cmp` showed no byte differences, and no relevant strings appeared in the post-kexec dump image.
+Observed after reboot:
+```text
+kexec_loaded       = 0
+kexec_crash_loaded = 0
+kexec_crash_size   = 0
+```
+Faultmanager still recorded the boot reason as:
+```text
+cpuAbnormal
+```
+Conclusion:
+```text
+A normal Linux panic writes to /dev/mmcblk0p52.
+A failed kexec-e does not write to /dev/mmcblk0p52.
+```
+Therefore, the `kexec -e` failure does not appear to go through the normal Linux panic/oops/mmcoops path.
+Most likely explanations:
+```text
+1. Control leaves the running webOS kernel during machine_kexec.
+2. The destination kernel either never starts or does not start far enough to log anything.
+3. A platform/MICOM/firmware watchdog/reset path reboots the system.
+4. The reset is classified by webOS/MICOM as cpuAbnormal.
+```
+What this test cannot determine without UART:
+```text
+A. Whether machine_kexec jumps to the destination image at all.
+B. Whether the destination kernel executes any instructions.
+C. Whether it reaches early decompression/start_kernel.
+D. Whether a platform watchdog kills it after entry.
+```
+---
+Summary of findings
+Confirmed
+```text
+CONFIG_KEXEC=y.
+kexec -l succeeds.
+kexec -e causes a reboot after roughly 10-15 seconds.
+After reboot, webOS/faultmanager reports PowerOnReason=cpuAbnormal.
+LG dump partition is /dev/mmcblk0p52.
+/dev/mmcblk0p52 is used by LG mmcoops/dump.
+A controlled Linux panic writes a persistent panic log to p52.
+kexec -e does not modify p52.
+LG kdump service exists but is non-functional in this retail firmware.
+No upstream pstore support is compiled.
+No upstream crash dump support is compiled.
+No standard crashkernel memory is reserved.
+Framebuffer devices exist but are not useful as visible output.
+DPM watchdog timeout changes do not alter kexec-e reboot behavior.
+/dev/watchdog magic close does not alter kexec-e reboot behavior.
+```
+Not confirmed
+```text
+Whether the destination kernel receives control.
+Whether the destination kernel starts but dies early.
+Whether the platform reset is caused by MICOM, SP805, firmware, secure monitor, or hardware state left by machine_kexec.
+Whether a patched stock kernel could make kexec work.
+```
+---
+Current interpretation
+The current `kexec` path is not usable for reliably booting a custom kernel on this LG C1 firmware.
+The most defensible statement is:
+```text
+kexec_load works, but kexec_execute results in a platform-level cpuAbnormal reboot without entering the normal Linux panic/oops/mmcoops path.
+```
+This suggests the reset happens either:
+```text
+- after the stock webOS kernel has already left control, or
+- through a low-level platform/MICOM/firmware path that Linux cannot log, or
+- before/inside the destination kernel so early that no output or persistent dump is produced.
+```
+Without UART, there is no direct visibility into the transition.
+---
+Android port implications
+The practical consequence is:
+```text
+Do not currently rely on kexec to boot an Android kernel.
+```
+A native Android port using a custom kernel would require one of:
+```text
+- bootloader control,
+- working kexec,
+- physical UART to debug the failed transition,
+- LG O20 kernel sources/patches sufficient to fix machine_kexec/watchdog/reset handling,
+- or another bootchain/exploit path.
+```
+The more realistic near-term path is Android or Linux userspace on top of the stock webOS kernel.
+Possible stack:
+```text
+LG stock webOS kernel
+  +
+webOS userspace still booting normally
+  +
+chroot/container/proot Linux userspace
+  +
+experimental Android userspace components
+```
+Important Android kernel features to check next:
+```text
+CONFIG_ANDROID_BINDER_IPC
+CONFIG_ANDROID_BINDERFS
+CONFIG_ASHMEM or memfd compatibility
+CONFIG_CGROUPS
+CONFIG_NAMESPACES
+CONFIG_SECCOMP
+CONFIG_OVERLAY_FS
+CONFIG_EXT4_FS
+CONFIG_FUSE_FS
+CONFIG_TMPFS
+CONFIG_VETH
+CONFIG_TUN
+CONFIG_BRIDGE
+CONFIG_NETFILTER
+CONFIG_SECURITY_SELINUX
+CONFIG_DMA_SHARED_BUFFER
+ION / DMA-BUF / graphics memory support
+```
+Suggested command:
+```sh
+zcat /proc/config.gz 2>/dev/null | grep -i -E \
+'ANDROID|BINDER|ASHMEM|MEMFD|ION|DMABUF|DMA_SHARED|CGROUP|NAMESPACE|SECCOMP|OVERLAY|SQUASHFS|EXT4|LOOP|VETH|TUN|BRIDGE|NETFILTER|SELINUX|DEVTMPFS|TMPFS|FUSE'
+```
+If Binder is missing, a real Android userspace becomes much harder. If Binder exists, Android userspace on top of the LG kernel becomes more plausible.
+---
+Useful commands kept for reference
+Load and execute kexec
 ```sh
 cd /tmp/usb/sda/sda1/lgc1-kexec
-./kexec-run -u 2>/dev/null || true
-```
 
-Desactivar hooks automáticos:
+CMDLINE='console=ttyAMA0,115200n81 earlycon=pl011,mmio32,0xfe000000 ignore_loglevel loglevel=8 rdinit=/init root=/dev/ram0 rw maxcpus=1 nr_cpus=1 reset_devices irqpoll'
 
-```sh
-rm -f /var/lib/webosbrew/init.d/00kexec_usb_gate
-rm -f /var/lib/webosbrew/init.d/00pause_boot_probe
-rm -f /var/lib/webosbrew/init.d/00kexec_probe
-rm -f /var/lib/webosbrew/init.d/99kexec_dryrun
-```
+./ld-linux-aarch64.so.1 --library-path . ./kexec -l ./Image \
+  --dtb=./lgc1-running.dtb \
+  --initrd=./initramfs.cpio.gz \
+  --append="$CMDLINE" \
+  --debug
 
-Desactivar intento desde USB:
-
-```sh
-rm -f /tmp/usb/sda/sda1/lgc1-kexec/ENABLE_KEXEC
-touch /tmp/usb/sda/sda1/lgc1-kexec/DISABLE_KEXEC
+cat /sys/kernel/kexec_loaded
 sync
+./ld-linux-aarch64.so.1 --library-path . ./kexec -e
 ```
-
-No usar:
-
+Inspect kexec state
 ```sh
-systemctl stop webapp-mgr.service
+cat /sys/kernel/kexec_loaded 2>/dev/null || true
+cat /sys/kernel/kexec_crash_loaded 2>/dev/null || true
+cat /sys/kernel/kexec_crash_size 2>/dev/null || true
 ```
+Inspect crashkernel presence
+```sh
+tr ' ' '\n' < /proc/cmdline | grep -i crash || true
+grep -i -E 'crash|reserved|System RAM' /proc/iomem
+```
+Copy dump partition
+```sh
+cd /tmp/usb/sda/sda1/lgc1-kexec
+mkdir -p dump-copy
 
-En esta TV congeló/tumbó la sesión SSH.
+dd if=/dev/mmcblk0p52 of=dump-copy/p52-dump.bin bs=1M count=10
+md5sum dump-copy/p52-dump.bin
+strings dump-copy/p52-dump.bin | head -200
+```
+Controlled panic test
+```sh
+echo 1 > /proc/sys/kernel/sysrq
+sync
+echo c > /proc/sysrq-trigger
+```
+After reboot:
+```sh
+dd if=/dev/mmcblk0p52 of=p52-after-panic.bin bs=1M count=10
+strings p52-after-panic.bin | grep -i -E 'panic|oops|sysrq|Call trace|Kernel panic|Unable to handle|diagnosis'
+```
+Compare dump before/after kexec
+```sh
+cd /tmp/usb/sda/sda1/lgc1-kexec
+mkdir -p kexec-vs-dump-test
 
+RUN="run-$(date +%Y%m%d-%H%M%S)"
+echo "$RUN" > kexec-vs-dump-test/current-run.txt
+mkdir -p "kexec-vs-dump-test/$RUN/before" "kexec-vs-dump-test/$RUN/after"
+
+dd if=/dev/mmcblk0p52 of="kexec-vs-dump-test/$RUN/before/p52-before-kexec.bin" bs=1M count=10
+md5sum "kexec-vs-dump-test/$RUN/before/p52-before-kexec.bin" > "kexec-vs-dump-test/$RUN/before/md5-before.txt"
+sync
+
+# Run kexec-e here, then SSH back in after reboot.
+
+RUN="$(cat kexec-vs-dump-test/current-run.txt)"
+dd if=/dev/mmcblk0p52 of="kexec-vs-dump-test/$RUN/after/p52-after-kexec.bin" bs=1M count=10
+md5sum "kexec-vs-dump-test/$RUN/after/p52-after-kexec.bin" > "kexec-vs-dump-test/$RUN/after/md5-after.txt"
+
+if cmp -s "kexec-vs-dump-test/$RUN/before/p52-before-kexec.bin" \
+          "kexec-vs-dump-test/$RUN/after/p52-after-kexec.bin"; then
+  echo "P52_UNCHANGED"
+else
+  echo "P52_CHANGED"
+fi | tee "kexec-vs-dump-test/$RUN/after/p52-change-result.txt"
+```
 ---
-
-## Git
-
-Añadir documentación:
-
-```sh
-git add README.md
-git commit -m "Document LG C1 kexec experiments and current blocker"
-git push
-```
-
-Si se añaden scripts:
-
-```sh
-git add scripts/ initramfs/ tv/kexec-run tools/
-git commit -m "Add LG C1 kexec tooling"
-git push
-```
-
-No commitear dumps propietarios o binarios extraídos:
-
+Recommended next steps
+Highest value
 ```text
-extracted/*.bin
-Image
-*.dtb
-tv/kexec
-tv/ld-linux-aarch64.so.1
-tv/libc.so*
-tv/libz.so*
-out/*.cpio.gz
+1. Obtain physical UART.
+2. Capture serial output during kexec-e.
+3. Determine whether execution reaches the destination kernel.
+4. Acquire LG GPL/O20 kernel sources matching this firmware.
+5. Inspect machine_kexec.c, wdt_log_kexec_setup, wdt_detect, mmcoops, MICOM reset logic.
 ```
-
+Android/userspace path
+```text
+1. Check Android kernel feature support in /proc/config.gz.
+2. Test Binder availability.
+3. Test cgroups/namespaces/seccomp/mount behavior.
+4. Start with Linux chroot/container on webOS.
+5. Attempt minimal Android userspace only after confirming Binder and graphics/input/audio feasibility.
+```
+Do not spend more time on, unless new visibility is available
+```text
+- Repeating blind kexec-e attempts.
+- Instrumenting purgatory without UART.
+- Writing to internal partitions.
+- Reading random /proc or /sys driver nodes that may block or hang the TV.
+```
 ---
-
-## Estado final de esta sesión
-
+Final conclusion
+Current status:
 ```text
-Hito conseguido:
-  kernel LG original extraído y cargable con kexec.
-
-Bloqueo:
-  kexec -e provoca cpuAbnormal/reset a ~10 s incluso al intentar arrancar webOS original.
-
-Siguiente paso real:
-  UART serie o instrumentación de kernel/machine_kexec.
+Custom kernel via current kexec path: blocked / not reliable.
+Native Android kernel boot: not currently viable through this method.
+Android/Linux userspace on top of the stock webOS kernel: most realistic next research direction.
 ```
+The key evidence is:
+```text
+panic -> /dev/mmcblk0p52 receives persistent mmcoops log
+kexec-e -> reboot + cpuAbnormal, but /dev/mmcblk0p52 unchanged
+```
+Therefore, failed `kexec -e` is not behaving like a Linux panic. It is most likely a low-level platform reset during or after the kexec transition.
