@@ -1,4 +1,5 @@
 LG C1 / webOS kexec research notes
+
 This document summarizes the current state of the `LG-C1-kernel` research effort: attempting to boot a custom kernel on an LG C1 webOS TV using `kexec`, identifying LG's crash/dump mechanisms, and assessing whether an Android port would need to run on top of the stock webOS kernel.
 > **Safety warning**
 >
